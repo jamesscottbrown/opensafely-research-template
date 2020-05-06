@@ -340,9 +340,8 @@ def test_clinical_event_with_count():
             between=["2001-12-01", "2002-06-01"],
             returning="number_of_matches_in_period",
             find_first_match_in_period=True,
-            include_date_of_match=True,
-            include_month=True,
         ),
+        asthma_count_date=patients.date_of("asthma_count", include_month=True)
     )
     results = study.to_dicts()
     assert [x["asthma_count"] for x in results] == ["0", "3", "0"]
@@ -367,9 +366,8 @@ def test_clinical_event_with_code():
             between=["2001-12-01", "2002-06-01"],
             returning="code",
             find_last_match_in_period=True,
-            include_date_of_match=True,
-            include_month=True,
         ),
+        latest_asthma_code_date=patients.date_of("latest_asthma_code", include_month=True)
     )
     results = study.to_dicts()
     assert [x["latest_asthma_code"] for x in results] == ["0", condition_code, "0"]
@@ -399,9 +397,8 @@ def test_clinical_event_with_numeric_value():
             between=["2001-12-01", "2002-06-01"],
             returning="numeric_value",
             find_first_match_in_period=True,
-            include_date_of_match=True,
-            include_month=True,
         ),
+        asthma_value_date=patients.date_of("asthma_value", include_month=True)
     )
     results = study.to_dicts()
     assert [x["asthma_value"] for x in results] == ["0.0", "2.0", "0.0"]
@@ -432,8 +429,8 @@ def test_clinical_event_with_category():
             codes,
             returning="category",
             find_last_match_in_period=True,
-            include_date_of_match=True,
         ),
+        code_category_date=patients.date_of("code_category"),
     )
     results = study.to_dicts()
     assert [x["code_category"] for x in results] == ["", "B", "C"]

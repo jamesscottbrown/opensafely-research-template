@@ -1495,6 +1495,11 @@ class patients:
         validate_time_period_options(**locals())
         return "with_death_recorded_in_cpns", locals()
 
+    @staticmethod
+    def date_of(source, include_month=False, include_day=False):
+        returning = "date"
+        return "value_from", locals()
+
 
 def validate_time_period_options(
     # Set date limits
