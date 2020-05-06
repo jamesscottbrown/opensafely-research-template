@@ -26,10 +26,32 @@ class StudyDefinition:
     def __init__(self, population, **covariates):
         covariates["population"] = population
         assert "patient_id" not in covariates, "patient_id is a reserved column name"
+        covariates = self.apply_compatibility_fixes(covariates)
         self.codelist_tables = []
         self.covariate_definitions = covariates
         self.queries = self.build_queries(covariates)
         self.pandas_csv_args = self.get_pandas_csv_args(covariates)
+
+    def apply_compatibility_fixes(self, covariate_definitions):
+        updated = {}
+        for name, (query_type, query_args) in covariate_definitions.items():
+            query_args = query_args.copy()
+            suffix = None
+            if query_args.pop("include_date_of_match", False):
+                suffix = "_date"
+            if query_args.pop("include_measurement_date", False):
+                suffix = "_date_measured"
+            if suffix:
+                date_kwargs = pop_keys_from_dict(
+                    query_args, ["include_month", "include_day"]
+                )
+                date_kwargs["source"] = name
+                date_kwargs["returning"] = "date"
+                updated[name] = (query_type, query_args)
+                updated[name + suffix] = ("value_from", date_kwargs)
+            else:
+                updated[name] = (query_type, query_args)
+        return updated
 
     def _to_csv_with_sqlcmd(self, filename):
         unique_check = UniqueCheck()
@@ -169,6 +191,10 @@ class StudyDefinition:
                 dtypes[name] = "category"
             elif funcname == "have_died_of_covid":
                 dtypes[name] = "category"
+            elif funcname == "most_recent_bmi":
+                dtypes[name] = "float"
+            elif funcname == "mean_recorded_value":
+                dtypes[name] = "float"
             else:
                 raise ValueError(
                     f"Unable to impute Pandas type for {name} ({funcname})"
@@ -223,6 +249,9 @@ class StudyDefinition:
         covariate_definitions, hidden_columns = self.flatten_nested_covariates(
             covariate_definitions
         )
+        covariate_definitions = self.add_include_date_flags_to_columns(
+            covariate_definitions
+        )
         # Ensure that patient_id is the first output column by reserving its
         # place here even though we won't define it until later
         output_columns = {"patient_id": None}
@@ -236,18 +265,20 @@ class StudyDefinition:
                     output_columns, **query_args
                 )
                 continue
+            # `value_from` columns also don't generate a table, they just take
+            # a value from another table
+            if query_type == "value_from":
+                assert query_args["returning"] == "date"
+                assert query_args["source"] in table_queries
+                output_columns[name] = f"ISNULL(#{query_args['source']}.date, '')"
+                continue
             cols, sql = self.get_query(name, query_type, query_args)
             table_queries[name] = f"SELECT * INTO #{name} FROM ({sql}) t"
             # The first column should always be patient_id so we can join on it
-            assert len(cols) > 1
             assert cols[0] == "patient_id"
-            for n, col in enumerate(cols[1:]):
-                # The first result column is given the name of the desired
-                # output column. The rest are added as suffixes to the name of
-                # the output column
-                output_col = name if n == 0 else f"{name}_{col}"
-                default_value = quote(self.default_for_column(col))
-                output_columns[output_col] = f"ISNULL(#{name}.{col}, {default_value})"
+            value_column = cols[1]
+            default_value = quote(self.default_for_column(value_column))
+            output_columns[name] = f"ISNULL(#{name}.{value_column}, {default_value})"
         # If the population query defines its own temporary table then we use
         # that as the primary table to query against and left join everything
         # else against that. Otherwise, we use the `Patient` table.
@@ -297,6 +328,7 @@ class StudyDefinition:
         while items:
             name, (query_type, query_args) = items.pop(0)
             if query_type == "categorised_as" and "extra_columns" in query_args:
+                query_args = query_args.copy()
                 # Pull out the extra columns
                 extra_columns = query_args.pop("extra_columns")
                 # Stick the query back on the stack
@@ -310,6 +342,19 @@ class StudyDefinition:
                     raise ValueError(f"Duplicate columns named '{name}'")
                 flattened[name] = (query_type, query_args)
         return flattened, hidden
+
+    def add_include_date_flags_to_columns(self, covariate_definitions):
+        updated = copy.deepcopy(covariate_definitions)
+        for name, (query_type, query_args) in updated.items():
+            if query_type == "value_from" and query_args["returning"] == "date":
+                source_column = query_args["source"]
+                source_column_args = updated[source_column][1]
+                source_column_args.update(
+                    include_date_of_match=True,
+                    include_month=query_args.get("include_month"),
+                    include_day=query_args.get("include_day"),
+                )
+        return updated
 
     def default_for_column(self, column_name):
         is_str_col = (
@@ -468,7 +513,7 @@ class StudyDefinition:
         between=None,
         minimum_age_at_measurement=16,
         # Add an additional column indicating when measurement was taken
-        include_measurement_date=False,
+        include_date_of_match=False,
         # If we're returning a date, how granular should it be?
         include_month=False,
         include_day=False,
@@ -573,7 +618,7 @@ class StudyDefinition:
         SELECT
           patients.Patient_ID AS patient_id,
           ROUND(COALESCE(weight/SQUARE(NULLIF(height, 0)), bmis.BMI), 1) AS BMI,
-          {date_column_defintion} AS date_measured
+          {date_column_defintion} AS date
         FROM ({patients_cte}) AS patients
         LEFT JOIN ({weights_cte}) AS weights
         ON weights.Patient_ID = patients.Patient_ID AND DATEDIFF(YEAR, patients.DateOfBirth, weights.ConsultationDate) >= {min_age}
@@ -584,8 +629,8 @@ class StudyDefinition:
         -- XXX maybe add a "WHERE NULL..." here
         """
         columns = ["patient_id", "BMI"]
-        if include_measurement_date:
-            columns.append("date_measured")
+        if include_date_of_match:
+            columns.append("date")
         return columns, sql
 
     def patients_mean_recorded_value(
@@ -598,7 +643,7 @@ class StudyDefinition:
         on_or_after=None,
         between=None,
         # Add additional columns indicating when measurement was taken
-        include_measurement_date=False,
+        include_date_of_match=False,
         # If we're returning a date, how granular should it be?
         include_month=False,
         include_day=False,
@@ -621,7 +666,7 @@ class StudyDefinition:
         SELECT
           days.Patient_ID AS patient_id,
           AVG(CodedEvent.NumericValue) AS mean_value,
-          {date_definition} AS date_measured
+          {date_definition} AS date
         FROM (
             SELECT Patient_ID, CAST(MAX(ConsultationDate) AS date) AS date_measured
             FROM CodedEvent
@@ -637,8 +682,8 @@ class StudyDefinition:
         GROUP BY days.Patient_ID, days.date_measured
         """
         columns = ["patient_id", "mean_value"]
-        if include_measurement_date:
-            columns.append("date_measured")
+        if include_date_of_match:
+            columns.append("date")
         return columns, sql
 
     def patients_registered_as_of(self, reference_date):
@@ -1601,3 +1646,11 @@ class UniqueCheck:
         duplicates = self.count - len(self.ids)
         if duplicates != 0:
             raise RuntimeError(f"Duplicate IDs found ({duplicates} rows)")
+
+
+def pop_keys_from_dict(dictionary, keys):
+    new_dict = {}
+    for key in keys:
+        if key in dictionary:
+            new_dict[key] = dictionary.pop(key)
+    return new_dict
